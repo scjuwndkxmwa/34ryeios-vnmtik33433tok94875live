@@ -1,132 +1,223 @@
-
 import os
 import sys
+import json
+import time
+import shutil
+import signal
 import subprocess
+import threading
 from pathlib import Path
-
-# ============== SETTINGS ==============
 
 PLAYLIST_URL = (
     "https://youtube.com/playlist?"
     "list=PLbB-zzxmyt-qxqhYuwRWiDCAFgH8bDgkR"
 )
 
-RESTREAM_KEY = "re_12012590_event263b321ab25446e5b8f3f975dabd2c6a"
+RESTREAM_KEY = os.getenv("RESTREAM_STREAM_KEY", "").strip()
 RESTREAM_SERVER = "rtmp://live.restream.io/live"
 
-PROJECT_DIR = Path(__file__).resolve().parent
-VIDEO_FILE = PROJECT_DIR / "loop.mp4"
+VIDEO_FILE = Path("/app/loop.mp4")
+AUDIO_FIFO = Path("/tmp/playlist_audio.pcm")
 
-DATA_DIR = Path("/data")
-AUDIO_DIR = DATA_DIR / "playlist_audio"
-COMBINED_AUDIO = DATA_DIR / "playlist_complete.mp3"
-CONCAT_FILE = DATA_DIR / "concat_list.txt"
-DONE_FILE = DATA_DIR / "playlist_finished.txt"
+SAMPLE_RATE = 48000
+CHANNELS = 2
+CHUNK_SIZE = 65536
 
-# ======================================
-
-
-def run(command):
-    print("[RUN]", " ".join(map(str, command)), flush=True)
-    subprocess.run(command, check=True)
+stop_event = threading.Event()
+children = []
 
 
-def check_setup():
-    if not VIDEO_FILE.is_file():
-        raise FileNotFoundError(
-            "Missing loop.mp4. Upload it beside main.py in GitHub."
-        )
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-
-    for tool in ("ffmpeg", "yt-dlp"):
-        result = subprocess.run(
-            ["sh", "-c", f"command -v {tool}"],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Required tool missing: {tool}")
+def log(message):
+    print(message, flush=True)
 
 
-def download_playlist():
-    if COMBINED_AUDIO.is_file() and COMBINED_AUDIO.stat().st_size > 0:
-        print("[AUDIO] Reusing saved playlist.", flush=True)
-        return
+def run_capture(command):
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    return result.stdout
 
-    print("[DOWNLOAD] Downloading playlist audio.", flush=True)
 
-    run([
+def get_playlist():
+    log("[PLAYLIST] Reading playlist entries...")
+    raw = run_capture([
         "yt-dlp",
-        "--yes-playlist",
-        "--ignore-errors",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "128K",
-        "--output",
-        str(AUDIO_DIR / "%(playlist_index)05d-%(id)s.%(ext)s"),
+        "--flat-playlist",
+        "--dump-single-json",
+        "--no-warnings",
         PLAYLIST_URL,
     ])
+    data = json.loads(raw)
 
-    audio_files = sorted(AUDIO_DIR.glob("*.mp3"))
+    entries = data.get("entries") or []
+    videos = []
 
-    if not audio_files:
-        raise RuntimeError("No audio files downloaded.")
+    for entry in entries:
+        if not entry:
+            continue
 
-    print(f"[DOWNLOAD] Found {len(audio_files)} tracks.", flush=True)
+        video_id = entry.get("id")
+        url = entry.get("url")
 
-    with CONCAT_FILE.open("w", encoding="utf-8") as f:
-        for audio in audio_files:
-            f.write(f"file '{audio.as_posix()}'\n")
+        if video_id:
+            videos.append(
+                f"https://www.youtube.com/watch?v={video_id}"
+            )
+        elif url and url.startswith("http"):
+            videos.append(url)
 
-    temp_audio = DATA_DIR / "playlist_complete.tmp.mp3"
+    if not videos:
+        raise RuntimeError("Playlist is empty or unavailable.")
 
-    run([
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(CONCAT_FILE),
-        "-vn",
-        "-c:a", "libmp3lame",
-        "-b:a", "160k",
-        str(temp_audio),
-    ])
-
-    temp_audio.replace(COMBINED_AUDIO)
-    print("[AUDIO] Ordered playlist assembled.", flush=True)
+    log(f"[PLAYLIST] Found {len(videos)} entries.")
+    return videos
 
 
-def start_stream():
-    if DONE_FILE.exists():
-        print("[DONE] Playlist already played successfully.", flush=True)
-        return
+def stream_audio_into_fifo(video_urls):
+    # Keep this FIFO open for the whole broadcast.
+    # Audio is converted to raw PCM and passed directly to FFmpeg.
+    with AUDIO_FIFO.open("wb", buffering=0) as audio_pipe:
+        index = 0
 
-    if not COMBINED_AUDIO.is_file():
-        raise FileNotFoundError("Combined playlist audio is missing.")
+        while not stop_event.is_set():
+            url = video_urls[index]
+            index += 1
 
+            if index >= len(video_urls):
+                index = 0
+
+            log(f"[AUDIO] Track {index + 1 if False else index}/{len(video_urls)}")
+
+            downloader = subprocess.Popen(
+                [
+                    "yt-dlp",
+                    "--no-warnings",
+                    "--no-playlist",
+                    "-f", "bestaudio/best",
+                    "-o", "-",
+                    url,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=None,
+                bufsize=0,
+            )
+            children.append(downloader)
+
+            converter = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-i", "pipe:0",
+                    "-vn",
+                    "-f", "s16le",
+                    "-ar", str(SAMPLE_RATE),
+                    "-ac", str(CHANNELS),
+                    "pipe:1",
+                ],
+                stdin=downloader.stdout,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                bufsize=0,
+            )
+            children.append(converter)
+
+            if downloader.stdout:
+                downloader.stdout.close()
+
+            try:
+                while not stop_event.is_set():
+                    chunk = converter.stdout.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    audio_pipe.write(chunk)
+            finally:
+                if converter.stdout:
+                    converter.stdout.close()
+
+                for proc in (converter, downloader):
+                    if proc.poll() is None:
+                        proc.terminate()
+
+                for proc in (converter, downloader):
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+
+                for proc in (converter, downloader):
+                    if proc in children:
+                        children.remove(proc)
+
+            if stop_event.is_set():
+                break
+
+            log("[AUDIO] Track ended; moving to next track.")
+            time.sleep(0.3)
+
+
+def stop_all(*_args):
+    stop_event.set()
+
+    for proc in list(children):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+
+def main():
+    if not RESTREAM_KEY:
+        raise RuntimeError(
+            "Set RESTREAM_STREAM_KEY in Railway Variables."
+        )
+
+    if not VIDEO_FILE.is_file():
+        raise FileNotFoundError(
+            "loop.mp4 must be beside main.py."
+        )
+
+    for tool in ("ffmpeg", "yt-dlp"):
+        if not shutil.which(tool):
+            raise RuntimeError(f"Missing required tool: {tool}")
+
+    if AUDIO_FIFO.exists():
+        AUDIO_FIFO.unlink()
+
+    os.mkfifo(AUDIO_FIFO)
+
+    videos = get_playlist()
     output_url = f"{RESTREAM_SERVER}/{RESTREAM_KEY}"
 
-    command = [
+    log("[LIVE] Starting one continuous RTMP output.")
+    log("[VIDEO] loop.mp4 repeats continuously.")
+    log("[STORAGE] Playlist audio is streamed, not saved as files.")
+
+    publisher = subprocess.Popen([
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "info",
         "-nostdin",
 
-        # Repeat video forever
         "-stream_loop", "-1",
         "-re",
         "-i", str(VIDEO_FILE),
 
-        # Play the complete audio playlist once
         "-re",
-        "-i", str(COMBINED_AUDIO),
+        "-f", "s16le",
+        "-ar", str(SAMPLE_RATE),
+        "-ac", str(CHANNELS),
+        "-i", str(AUDIO_FIFO),
 
         "-map", "0:v:0",
         "-map", "1:a:0",
 
-        # TikTok vertical format
         "-vf",
         "scale=720:1280:force_original_aspect_ratio=decrease,"
         "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
@@ -142,40 +233,47 @@ def start_stream():
         "-bufsize", "4400k",
 
         "-c:a", "aac",
-        "-b:a", "160k",
+        "-b:a", "128k",
         "-ar", "48000",
         "-ac", "2",
 
-        # Stop output when audio ends
-        "-shortest",
         "-f", "flv",
         output_url,
-    ]
+    ])
+    children.append(publisher)
 
-    print("[LIVE] Loop video + ordered playlist audio.", flush=True)
-    run(command)
+    producer = threading.Thread(
+        target=stream_audio_into_fifo,
+        args=(videos,),
+        daemon=True,
+    )
+    producer.start()
 
-    DONE_FILE.write_text("finished\n", encoding="utf-8")
-    print("[DONE] Playlist finished.", flush=True)
-
-
-def main():
-    check_setup()
-
-    if DONE_FILE.exists():
-        print("[DONE] Already completed; not replaying.", flush=True)
-        return
-
-    download_playlist()
-    start_stream()
+    try:
+        while not stop_event.is_set():
+            if publisher.poll() is not None:
+                raise RuntimeError(
+                    f"FFmpeg publisher exited: {publisher.returncode}"
+                )
+            time.sleep(2)
+    finally:
+        stop_all()
+        if publisher.poll() is None:
+            publisher.terminate()
+            try:
+                publisher.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                publisher.kill()
+        if AUDIO_FIFO.exists():
+            AUDIO_FIFO.unlink()
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, stop_all)
+    signal.signal(signal.SIGINT, stop_all)
+
     try:
         main()
-    except subprocess.CalledProcessError as exc:
-        print(f"[ERROR] Process failed: {exc}", flush=True)
-        sys.exit(1)
     except Exception as exc:
-        print(f"[ERROR] {exc}", flush=True)
+        log(f"[ERROR] {exc}")
         sys.exit(1)
