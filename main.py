@@ -9,7 +9,7 @@ import tempfile
 import subprocess
 from pathlib import Path
 
-# ==================== SETTINGS ====================
+# ================= SETTINGS =================
 
 RESTREAM_SERVER = "rtmp://live.restream.io/live"
 RESTREAM_KEY = "re_12012590_event263b321ab25446e5b8f3f975dabd2c6a"
@@ -19,8 +19,7 @@ PLAYLIST_URL = (
     "list=PLbB-zzxmyt-qxqhYuwRWiDCAFgH8bDgkR"
 )
 
-VIDEO_FILE = Path(os.getenv("VIDEO_FILE", "loop.mp4"))
-
+VIDEO_FILE = Path(os.getenv("VIDEO_FILE", "/app/loop.mp4"))
 YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "4500k")
@@ -32,7 +31,6 @@ VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 AUDIO_RATE = 44100
 AUDIO_CHANNELS = 2
-
 RETRY_DELAY = 10
 
 stop_requested = False
@@ -46,17 +44,14 @@ def log(message):
 
 def check_setup():
     for program in ("ffmpeg", "yt-dlp"):
-        if shutil.which(program) is None:
-            raise RuntimeError(f"Required program not found: {program}")
+        if not shutil.which(program):
+            raise RuntimeError(f"Required program missing: {program}")
 
     if not RESTREAM_KEY:
         raise RuntimeError("RESTREAM_KEY is empty.")
 
     if not VIDEO_FILE.is_file():
-        raise RuntimeError(
-            f"Video file not found: {VIDEO_FILE}. "
-            "Put loop.mp4 beside main.py."
-        )
+        raise RuntimeError(f"Video file not found: {VIDEO_FILE}")
 
 
 def make_cookie_file():
@@ -64,29 +59,20 @@ def make_cookie_file():
 
     if not YOUTUBE_COOKIES_B64:
         log("[COOKIES] Cookies are OFF.")
-        return None
+        return
 
     try:
-        cookie_data = base64.b64decode(
-            YOUTUBE_COOKIES_B64,
-            validate=True,
-        )
-
-        fd, path = tempfile.mkstemp(
-            prefix="ytcookies_",
-            suffix=".txt",
-        )
+        data = base64.b64decode(YOUTUBE_COOKIES_B64, validate=True)
+        fd, path = tempfile.mkstemp(prefix="ytcookies_", suffix=".txt")
 
         with os.fdopen(fd, "wb") as file_obj:
-            file_obj.write(cookie_data)
+            file_obj.write(data)
 
         cookies_path = path
         log("[COOKIES] Temporary cookie file loaded.")
-        return path
 
     except Exception as exc:
-        log(f"[COOKIES] Could not decode cookie variable: {exc}")
-        return None
+        log(f"[COOKIES] Could not decode cookies: {exc}")
 
 
 def yt_dlp_base_args():
@@ -94,7 +80,7 @@ def yt_dlp_base_args():
         "yt-dlp",
         "--no-warnings",
         "--extractor-args",
-        "youtube:player_client=default,web_embedded",
+        "youtube:player_client=web_embedded,web,tv",
     ]
 
     if cookies_path:
@@ -121,7 +107,7 @@ def get_playlist_tracks():
 
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError(
-            "Could not read playlist:\n"
+            "Playlist extraction failed:\n"
             + (result.stderr or "")[-3000:]
         )
 
@@ -160,12 +146,12 @@ def build_ffmpeg_command():
         "-loglevel", "warning",
         "-nostdin",
 
-        # Loop video continuously
+        # Video loops continuously
         "-stream_loop", "-1",
         "-re",
         "-i", str(VIDEO_FILE),
 
-        # Audio is received through stdin as raw PCM
+        # Incoming audio is raw PCM through stdin
         "-f", "s16le",
         "-ar", str(AUDIO_RATE),
         "-ac", str(AUDIO_CHANNELS),
@@ -174,7 +160,7 @@ def build_ffmpeg_command():
         "-map", "0:v:0",
         "-map", "1:a:0",
 
-        # H.264 output for RTMP/FLV compatibility
+        # H.264 output for RTMP compatibility
         "-c:v", "libx264",
         "-preset", VIDEO_PRESET,
         "-tune", "zerolatency",
@@ -196,9 +182,9 @@ def build_ffmpeg_command():
 
 
 def start_main_stream():
-    log("[LIVE] Starting stream to Restream.")
-    log("[VIDEO] loop.mp4 will loop continuously.")
-    log("[STORAGE] Audio tracks will not be saved to disk.")
+    log("[LIVE] Connecting to Restream.")
+    log("[VIDEO] loop.mp4 repeats continuously.")
+    log("[STORAGE] Audio tracks are not saved to disk.")
 
     return subprocess.Popen(
         build_ffmpeg_command(),
@@ -269,7 +255,6 @@ def stream_track(track, index, total):
         )
 
         downloader.stdout.close()
-
         bytes_sent = 0
 
         while not stop_requested:
@@ -291,11 +276,7 @@ def stream_track(track, index, total):
         if stop_requested:
             return True
 
-        if (
-            bytes_sent == 0
-            or converter_rc != 0
-            or downloader_rc != 0
-        ):
+        if bytes_sent == 0 or converter_rc != 0 or downloader_rc != 0:
             log(
                 "[WARN] Audio extraction failed: "
                 f"yt-dlp={downloader_rc}, "
@@ -314,14 +295,12 @@ def stream_track(track, index, total):
         stop_process(converter)
         stop_process(downloader)
 
-        if converter and converter.stdout:
-            converter.stdout.close()
-
-        if downloader and downloader.stdout:
-            try:
-                downloader.stdout.close()
-            except Exception:
-                pass
+        for proc in (converter, downloader):
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
 
 
 def stop_handler(signum, frame):
@@ -348,7 +327,6 @@ def cleanup():
             os.remove(cookies_path)
         except OSError:
             pass
-
         cookies_path = None
 
 
@@ -365,7 +343,6 @@ def main():
         try:
             tracks = get_playlist_tracks()
             main_ffmpeg = start_main_stream()
-
             index = 0
 
             while not stop_requested:
@@ -375,10 +352,8 @@ def main():
                         f"{main_ffmpeg.returncode}."
                     )
 
-                track = tracks[index]
-
                 success = stream_track(
-                    track,
+                    tracks[index],
                     index + 1,
                     len(tracks),
                 )
@@ -390,16 +365,14 @@ def main():
                     log("[WARN] Skipping failed track.")
                     time.sleep(1)
 
-                # Continue through the playlist, then repeat it
                 index = (index + 1) % len(tracks)
 
         except Exception as exc:
             log(f"[ERROR] {exc}")
 
             if not stop_requested:
-                log(f"[RETRY] Restarting in {RETRY_DELAY} seconds.")
-
                 cleanup()
+                log(f"[RETRY] Restarting in {RETRY_DELAY} seconds.")
 
                 for _ in range(RETRY_DELAY):
                     if stop_requested:
