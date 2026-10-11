@@ -1,3 +1,4 @@
+
 import os
 import sys
 import json
@@ -13,7 +14,7 @@ PLAYLIST_URL = (
     "list=PLbB-zzxmyt-qxqhYuwRWiDCAFgH8bDgkR"
 )
 
-RESTREAM_KEY = os.getenv("RESTREAM_STREAM_KEY", "").strip()
+RESTREAM_KEY = "re_12012590_event263b321ab25446e5b8f3f975dabd2c6a"
 RESTREAM_SERVER = "rtmp://live.restream.io/live"
 
 VIDEO_FILE = Path("/app/loop.mp4")
@@ -43,7 +44,7 @@ def run_capture(command):
 
 
 def get_playlist():
-    log("[PLAYLIST] Reading playlist entries...")
+    log("[PLAYLIST] Reading playlist...")
     raw = run_capture([
         "yt-dlp",
         "--flat-playlist",
@@ -53,77 +54,53 @@ def get_playlist():
     ])
     data = json.loads(raw)
 
-    entries = data.get("entries") or []
     videos = []
-
-    for entry in entries:
-        if not entry:
-            continue
-
-        video_id = entry.get("id")
-        url = entry.get("url")
-
-        if video_id:
+    for entry in data.get("entries") or []:
+        if entry and entry.get("id"):
             videos.append(
-                f"https://www.youtube.com/watch?v={video_id}"
+                f"https://www.youtube.com/watch?v={entry['id']}"
             )
-        elif url and url.startswith("http"):
-            videos.append(url)
 
     if not videos:
         raise RuntimeError("Playlist is empty or unavailable.")
 
-    log(f"[PLAYLIST] Found {len(videos)} entries.")
+    log(f"[PLAYLIST] Found {len(videos)} tracks.")
     return videos
 
 
-def stream_audio_into_fifo(video_urls):
-    # Keep this FIFO open for the whole broadcast.
-    # Audio is converted to raw PCM and passed directly to FFmpeg.
+def stream_audio(video_urls):
     with AUDIO_FIFO.open("wb", buffering=0) as audio_pipe:
         index = 0
 
         while not stop_event.is_set():
             url = video_urls[index]
-            index += 1
+            track_number = index + 1
+            index = (index + 1) % len(video_urls)
 
-            if index >= len(video_urls):
-                index = 0
+            log(f"[AUDIO] Track {track_number}/{len(video_urls)}")
 
-            log(f"[AUDIO] Track {index + 1 if False else index}/{len(video_urls)}")
-
-            downloader = subprocess.Popen(
-                [
-                    "yt-dlp",
-                    "--no-warnings",
-                    "--no-playlist",
-                    "-f", "bestaudio/best",
-                    "-o", "-",
-                    url,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=None,
-                bufsize=0,
-            )
+            downloader = subprocess.Popen([
+                "yt-dlp",
+                "--no-warnings",
+                "--no-playlist",
+                "-f", "bestaudio/best",
+                "-o", "-",
+                url,
+            ], stdout=subprocess.PIPE, bufsize=0)
             children.append(downloader)
 
-            converter = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-i", "pipe:0",
-                    "-vn",
-                    "-f", "s16le",
-                    "-ar", str(SAMPLE_RATE),
-                    "-ac", str(CHANNELS),
-                    "pipe:1",
-                ],
-                stdin=downloader.stdout,
-                stdout=subprocess.PIPE,
-                stderr=None,
-                bufsize=0,
-            )
+            converter = subprocess.Popen([
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", "pipe:0",
+                "-vn",
+                "-f", "s16le",
+                "-ar", str(SAMPLE_RATE),
+                "-ac", str(CHANNELS),
+                "pipe:1",
+            ], stdin=downloader.stdout,
+               stdout=subprocess.PIPE, bufsize=0)
             children.append(converter)
 
             if downloader.stdout:
@@ -136,34 +113,25 @@ def stream_audio_into_fifo(video_urls):
                         break
                     audio_pipe.write(chunk)
             finally:
-                if converter.stdout:
-                    converter.stdout.close()
-
                 for proc in (converter, downloader):
                     if proc.poll() is None:
                         proc.terminate()
-
                 for proc in (converter, downloader):
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
-
-                for proc in (converter, downloader):
                     if proc in children:
                         children.remove(proc)
 
-            if stop_event.is_set():
-                break
-
-            log("[AUDIO] Track ended; moving to next track.")
-            time.sleep(0.3)
+            if not stop_event.is_set():
+                log("[AUDIO] Moving to next track.")
+                time.sleep(0.3)
 
 
-def stop_all(*_args):
+def stop_all(*_):
     stop_event.set()
-
     for proc in list(children):
         try:
             if proc.poll() is None:
@@ -173,56 +141,42 @@ def stop_all(*_args):
 
 
 def main():
-    if not RESTREAM_KEY:
-        raise RuntimeError(
-            "Set RESTREAM_STREAM_KEY in Railway Variables."
-        )
-
     if not VIDEO_FILE.is_file():
-        raise FileNotFoundError(
-            "loop.mp4 must be beside main.py."
-        )
+        raise FileNotFoundError("Upload loop.mp4 beside main.py.")
 
     for tool in ("ffmpeg", "yt-dlp"):
         if not shutil.which(tool):
-            raise RuntimeError(f"Missing required tool: {tool}")
+            raise RuntimeError(f"Missing tool: {tool}")
 
     if AUDIO_FIFO.exists():
         AUDIO_FIFO.unlink()
-
     os.mkfifo(AUDIO_FIFO)
 
     videos = get_playlist()
     output_url = f"{RESTREAM_SERVER}/{RESTREAM_KEY}"
 
-    log("[LIVE] Starting one continuous RTMP output.")
-    log("[VIDEO] loop.mp4 repeats continuously.")
-    log("[STORAGE] Playlist audio is streamed, not saved as files.")
+    log("[LIVE] Starting stream to Restream.")
+    log("[VIDEO] loop.mp4 loops continuously.")
+    log("[STORAGE] Audio is streamed without saving playlist files.")
 
     publisher = subprocess.Popen([
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "info",
         "-nostdin",
-
         "-stream_loop", "-1",
-        "-re",
-        "-i", str(VIDEO_FILE),
-
+        "-re", "-i", str(VIDEO_FILE),
         "-re",
         "-f", "s16le",
         "-ar", str(SAMPLE_RATE),
         "-ac", str(CHANNELS),
         "-i", str(AUDIO_FIFO),
-
         "-map", "0:v:0",
         "-map", "1:a:0",
-
         "-vf",
         "scale=720:1280:force_original_aspect_ratio=decrease,"
         "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
         "setsar=1,format=yuv420p",
-
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
@@ -231,19 +185,17 @@ def main():
         "-b:v", "2200k",
         "-maxrate", "2200k",
         "-bufsize", "4400k",
-
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "48000",
         "-ac", "2",
-
         "-f", "flv",
         output_url,
     ])
     children.append(publisher)
 
     producer = threading.Thread(
-        target=stream_audio_into_fifo,
+        target=stream_audio,
         args=(videos,),
         daemon=True,
     )
@@ -253,7 +205,7 @@ def main():
         while not stop_event.is_set():
             if publisher.poll() is not None:
                 raise RuntimeError(
-                    f"FFmpeg publisher exited: {publisher.returncode}"
+                    f"FFmpeg exited with code {publisher.returncode}"
                 )
             time.sleep(2)
     finally:
