@@ -12,7 +12,7 @@ from pathlib import Path
 # ================= SETTINGS =================
 
 RESTREAM_SERVER = "rtmp://live.restream.io/live"
-RESTREAM_KEY = "re_12012590_event263b321ab25446e5b8f3f975dabd2c6a"
+RESTREAM_KEY = "re_12012590_event8d4fbd2ce937417fbfc8e0d48df82cdf"
 
 PLAYLIST_URL = (
     "https://youtube.com/playlist?"
